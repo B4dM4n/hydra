@@ -43,6 +43,17 @@ __PACKAGE__->config(
                 role_field => "role",
             },
         },
+        authentik => {
+            credential => {
+                class => 'AuthentikProxy',
+            },
+            store => {
+                class => "DBIx::Class",
+                user_class => "DB::Users",
+                role_relation => "userroles",
+                role_field => "role",
+            },
+        },
         ldap => getLDAPConfigAmbient()->{'config'}
     },
     'Plugin::ConfigLoader' => {

@@ -8,7 +8,11 @@
     function finishSignOut() {
       $.post("[% c.uri_for('/logout') %]")
         .done(function(data) {
-          window.location.reload();
+          [% IF c.stash.authentikProxyLogin %]
+            window.location.assign("/outpost.goauthentik.io/sign_out");
+          [% ELSE %]
+            window.location.reload();
+          [% END %]
         })
         .fail(function() { bootbox.alert("Server request failed!"); });
     }
