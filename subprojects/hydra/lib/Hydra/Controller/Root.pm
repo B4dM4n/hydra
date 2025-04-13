@@ -63,6 +63,27 @@ sub begin :Private {
     $c->stash->{localStore} = isLocalStore;
 
     $c->stash->{isPrivateHydra} = $c->config->{private} // "0" ne "0";
+    $c->stash->{authentikProxyLogin} = $c->config->{enable_authentik_proxy_login} // "0" ne "0";
+
+    if ($c->stash->{authentikProxyLogin}) {
+        my $username = $c->request->headers->header('X-authentik-username') or die;
+        if ($c->user_exists && $c->user->username ne $username) {
+            $c->logout;
+        }
+        if (!$c->user_exists) {
+            if (!$c->find_user({ username => $username })) {
+                $c->model('DB::Users')->create(
+                    { username => $username
+                    , fullname => $c->request->headers->header('X-authentik-name')
+                    , password => "!"
+                    , emailaddress => $c->request->headers->header('X-authentik-email')
+                    , type => "hydra"
+                });
+            }
+            $c->authenticate({}, 'authentik') or
+                accessDenied($c, "This page requires you to sign in.");
+        }
+    }
 
     if ($c->stash->{isPrivateHydra} && ! noLoginNeeded($c)) {
         requireUser($c);
