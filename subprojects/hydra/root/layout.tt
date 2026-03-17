@@ -1,0 +1,86 @@
+[% USE date %]
+[% USE HTML %]
+[% PROCESS common.tt %]
+<!DOCTYPE html>
+
+<html lang="en">
+
+  <head>
+    <title>Hydra - [% HTML.escape(title) %]</title>
+
+    <meta http-equiv="Content-Type" content="text/html; charset=utf-8" />
+    <meta http-equiv="X-UA-Compatible" content="IE=Edge" />
+    [% INCLUDE style.tt %]
+
+    [% IF c.config.enable_google_login %]
+      <meta name="google-signin-client_id" content="[% c.config.google_client_id %]">
+    [% END %]
+
+    [% tracker %]
+
+  </head>
+
+  <body>
+
+    <nav class="navbar navbar-expand-md navbar-light bg-light">
+      <div class="container">
+        <a class="navbar-brand" [% HTML.attributes(href => c.uri_for(c.controller('Root').action_for('index'))) %]>
+          [% IF logo == "" %]
+            Hydra
+          [% ELSE %]
+            <img src="[% c.uri_for(logo) %]" alt="Hydra Logo" class="logo" />
+          [% END %]
+        </a>
+        <button type="button" class="navbar-toggler" data-toggle="collapse" data-target="#navbarSupportedContent">
+          <span class="navbar-toggler-icon"></span>
+        </button>
+        <div class="collapse navbar-collapse" id="navbarSupportedContent">
+          [% PROCESS topbar.tt %]
+        </div>
+      </div>
+    </nav>
+
+    <div class="container">
+      <div class="skip-topbar"></div>
+
+      [% IF flashMsg %]
+        <div class="alert alert-info">[% flashMsg %]</div>
+      [% END %]
+
+      [% IF successMsg %]
+        <div class="alert alert-success">[% successMsg %]</div>
+      [% END %]
+
+      [% IF errorMsg %]
+        <div class="alert alert-warning">Error: [% errorMsg %]</div>
+      [% END %]
+
+      [% IF !hideHeader %]
+        <div class="page-header">
+          [% IF c.user_exists && starUri; INCLUDE makeStar; " "; END %]
+          [% IF titleHTML != ""; titleHTML; ELSE; HTML.escape(title); END %]
+        </div>
+      [% ELSE %]
+        [% IF first %]<br />[% first = 0; END; %]
+      [% END %]
+
+      [% content %]
+
+      <footer class="navbar">
+        <hr />
+        <small>
+          <em><a href="http://nixos.org/hydra" target="_blank" class="squiggle">Hydra</a> [% HTML.escape(version) %] (using [% HTML.escape(nixVersion) %] and [% HTML.escape(nixEvalJobsVersion) %]).</em>
+          [% IF c.user_exists %]
+          You are signed in as <tt>[% HTML.escape(c.user.username) %]</tt>
+            [%- IF c.user.type == 'google' %] via Google[% END %].
+          [% END %]
+        </small>
+      </footer>
+
+    </div>
+
+    [% PROCESS auth.tt %]
+
+  </body>
+
+</html>

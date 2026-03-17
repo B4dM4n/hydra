@@ -1,0 +1,286 @@
+[% BLOCK renderProductLinks %]
+  <tr>
+    <th>URL:</th>
+    <td><a [% HTML.attributes(href => uri) %]><tt>[% uri | html %]</tt></a></td>
+  </tr>
+  [% IF latestRoot %]
+  <tr>
+    <th>Links to latest:</th>
+    <td>
+      [% uri2 = "${c.uri_for(latestRoot.join('/') 'download-by-type' product.type product.subtype)}" %]
+      <a [% HTML.attributes(href => uri2) %]><tt>[% uri2 | html %]</tt></a>
+      <br />
+      [% uri2 = "${c.uri_for(latestRoot.join('/') 'download' product.productnr)}" %]
+      <a [% HTML.attributes(href => uri2) %]><tt>[% uri2 | html %]</tt></a>
+    </td>
+  </tr>
+  [% END %]
+[% END %]
+
+[% BLOCK renderProductList %]
+
+  <table class="table table-striped">
+    <tr>
+       <th></th>
+       <th>Type</th>
+       <th>Link</th>
+       <th>Actions</th>
+    </tr>
+
+    [% FOREACH product IN build.buildproducts %]
+
+      [% uri = "${c.uri_for('/build' build.id 'download' product.productnr)}"
+          _ (product.name ? "/" _ product.name : "")
+          _ (product.defaultpath ? "/" _ product.defaultpath : "") %]
+
+      [% contents = c.uri_for('/build' build.id 'contents' product.productnr) %]
+
+      [% SWITCH product.type %]
+
+      [% CASE "nix-build" %]
+        [% IF build.buildstatus == 6 %]
+          [% filename = build.nixname _ (product.subtype ? "-" _ product.subtype : "") _ ".closure.gz" %]
+          [% uri = c.uri_for('/build' build.id 'nix' 'closure' filename ) %]
+          <tr class="product">
+            <td>
+              <img src="[% c.uri_for("/static/images/error_32.png") %]" alt="Source" />
+            </td>
+            <td>
+              Error
+            </td>
+            <td>
+              <a [% HTML.attributes(href => contents) %]>
+                Failed build produced output. Click here to inspect the output.
+              </a>
+            </td>
+            <td>
+             [% WRAPPER makePopover title="Help" classes="btn-secondary btn-sm" %]
+               <p>If you have Nix installed on your machine, this failed build output and
+               all its dependencies can be unpacked into your local Nix store by doing:</p>
+
+               <div class="card bg-light"><div class="card-body p-2"><code><span class="shell-prompt">$ </span>curl [% HTML.escape(uri) %] | gunzip | nix-store --import</code></div></div>
+
+               <p>The build output can then be found in the path <tt>[% product.path | html %]</tt>.</p>
+             [% END %]
+            </td>
+          </tr>
+
+        [% ELSE %]
+          <tr class="product">
+            <td>
+              <img src="[% c.uri_for("/static/images/nix-build.png") %]" alt="Source" />
+            </td>
+            <td>
+              Nix package
+            </td>
+            <td>
+              <tt>[% build.nixname | html %]</tt>
+            </td>
+            <td>
+              [% WRAPPER makePopover title="Help" classes="btn-secondary btn-sm"
+              %] <p>You can install this package using the Nix package
+              manager from the command-line:</p>
+
+                <div class="card bg-light"><div class="card-body p-2"><code><span class="shell-prompt">$ </span>nix-env -i [% HTML.escape(product.path) %][% IF binaryCachePublicUri %] --option binary-caches [% HTML.escape(binaryCachePublicUri) %][% END %]</code></div></div>
+              [% END %]
+              [% IF localStore %]
+                <a class="btn btn-secondary btn-sm" [% HTML.attributes(href => contents) %]>Contents</a>
+              [% END %]
+            </td>
+          </tr>
+          [% IF localStore %]
+          <tr class="product">
+            <td>
+              <img src="[% c.uri_for("/static/images/nix-build.png") %]" alt="Source" />
+            </td>
+            <td>
+              Nix closure
+            </td>
+            <td>
+              [% filename = build.nixname _ (product.subtype ? "-" _ product.subtype : "") _ ".closure.gz" %]
+              [% uri = c.uri_for('/build' build.id 'nix' 'closure' filename ) %]
+
+              <a [% HTML.attributes(href => uri) %]>
+                <tt>[% product.path | html %]</tt>
+              </a>
+            </td>
+            <td>
+              [% WRAPPER makePopover title="Help" classes="btn-secondary btn-sm" %]
+                <p>If you have Nix installed on your machine, this build and
+                all its dependencies can be unpacked into your local Nix
+                store by doing:</p>
+
+                <div class="card bg-light"><div class="card-body p-2"><code><span class="shell-prompt">$ </span>gunzip &lt; [% HTML.escape(filename) %] | nix-store --import</code></div></div>
+
+                <p>or to download and unpack in one command:</p>
+
+                <div class="card bg-light"><div class="card-body p-2"><code><span class="shell-prompt">$ </span>curl [% HTML.escape(uri) %] | gunzip | nix-store --import</code></div></div>
+
+                <p>The package can then be found in the path <tt>[%
+                product.path | html %]</tt>.  You’ll probably also want to do</p>
+
+                <div class="card bg-light"><div class="card-body p-2"><code><span class="shell-prompt">$ </span>nix-env -i [% HTML.escape(product.path) %]</code></div></div>
+
+                <p>to actually install the package in your Nix user environment.</p>
+
+                <p>If you get the error message “imported
+                archive lacks a signature”, you should make sure that you have
+                sufficient access rights to the Nix store, e.g., run the
+                command as <tt>root</tt>.</p>
+              [% END %]
+            </td>
+          </tr>
+          [% END %]
+        [% END %]
+
+      [% CASE ["file", "channel"] %]
+
+      <tr class="product">
+        [% SWITCH product.subtype %]
+        [% CASE "source-dist" %]
+          <td>
+            <img src="[% c.uri_for("/static/images/source-dist.png") %]" alt="Source" />
+          </td>
+          <td>Source distribution</td>
+        [% CASE "rpm" %]
+          <td>
+            <img src="[% c.uri_for("/static/images/rpm.png") %]" alt="RPM" />
+          </td>
+          <td>RPM package</td>
+        [% CASE "srpm" %]
+          <td>
+            <img src="[% c.uri_for("/static/images/rpm.png") %]" alt="Source RPM" />
+          </td>
+          <td>Source RPM package</td>
+        [% CASE "deb" %]
+          <td>
+            <img src="[% c.uri_for("/static/images/debian.png") %]" alt="DEB" />
+          </td>
+          <td>Debian package</td>
+        [% CASE "iso" %]
+          <td>
+            <img src="[% c.uri_for("/static/images/iso.png") %]" alt="ISO" />
+          </td>
+          <td>ISO-9660 CD/DVD image</td>
+        [% CASE "binary-dist" %]
+          <td>
+            <img src="[% c.uri_for("/static/images/binary-dist.png") %]" alt="Binary distribution" />
+          </td>
+          <td>Binary distribution</td>
+        [% CASE DEFAULT %]
+          [% IF product.type == "channel" %]
+            <td>
+              <img src="[% c.uri_for("/static/images/channel.png") %]" alt="Channel" />
+            </td>
+            <td>
+              Channel expression tarball
+              [% IF product.subtype != "-" %]for <tt>[% product.subtype | html %]</tt>[% END %]
+            </td>
+          [% ELSE %]
+            <td>File</td>
+            <td>[% HTML.escape(product.subtype) %]</td>
+          [% END %]
+        [% END %]
+        <td>
+          <a [% HTML.attributes(href => uri) %]>
+            <tt>[% product.name | html %]</tt>
+          </a>
+        </td>
+        <td>
+          [% WRAPPER makePopover title="Details" classes="btn-secondary btn-sm" %]
+            <table class="info-table">
+              [% INCLUDE renderProductLinks %]
+              <tr><th>File size:</th><td>[% product.filesize %] bytes ([% mibs(product.filesize / (1024 * 1024)) %] MiB)</td></tr>
+              <tr><th>SHA-256 hash:</th><td><tt>[% product.sha256hash | html %]</tt></td></tr>
+              <tr><th>Full path:</th><td><tt>[% product.path | html %]</tt></td></tr>
+            </table>
+          [% END %]
+          [% IF localStore %]
+            <a class="btn btn-secondary btn-sm" [% HTML.attributes(href => contents) %]>Contents</a>
+          [% END %]
+        </td>
+      </tr>
+
+      [% CASE "report" %]
+
+      <tr class="product">
+        <td>
+          <img src="[% c.uri_for("/static/images/report.png") %]" alt="Report" />
+        </td>
+        [% SWITCH product.subtype %]
+        [% CASE "coverage" %]
+          <td>Code coverage</td>
+          <td>
+            <a [% HTML.attributes(href => uri) %]>
+              Analysis report
+            </a>
+          </td>
+        [% CASE DEFAULT %]
+          <td>Report</td>
+          <td>
+            <a [% HTML.attributes(href => uri) %]>
+              <tt>[% product.subtype | html %]</tt>
+            </a>
+          </td>
+        [% END %]
+        <td></td>
+      </tr>
+
+      [% CASE ["doc", "doc-pdf"] %]
+
+      <tr class="product">
+        <td>
+          [% IF product.type == "doc-pdf" %]
+            <img src="[% c.uri_for("/static/images/pdf.png") %]" alt="PDF document" />
+          [% ELSE %]
+            <img src="[% c.uri_for("/static/images/document.png") %]" alt="Document" />
+          [% END %]
+        </td>
+        <td>
+          Documentation
+        </td>
+        <td>
+        <a [% HTML.attributes(href => uri) %]>
+          [% SWITCH product.subtype %]
+          [% CASE "readme" %]
+            Read Me!
+          [% CASE "manual" %]
+            Manual
+          [% CASE "release-notes" %]
+            Release notes
+          [% CASE DEFAULT %]
+            [% HTML.escape(product.subtype) %]
+          [% END %]
+        </a>
+        </td>
+        <td>
+          [% WRAPPER makePopover title="Details" classes="btn-secondary btn-sm" %]
+            <table class="info-table">
+              [% INCLUDE renderProductLinks %]
+            </table>
+          [% END %]
+        </td>
+      </tr>
+
+      [% CASE DEFAULT %]
+
+      <tr class="product">
+        <td>
+          <tt>[% product.type | html %]</tt>
+        </td>
+        <td>
+        </td>
+        <td>
+         [% HTML.escape(product) %]
+        </td>
+        <td>
+        </td>
+      </tr>
+
+      [% END %]
+
+    [% END %]
+
+  </table>
+
+[% END %]

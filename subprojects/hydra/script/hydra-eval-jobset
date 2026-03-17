@@ -1,0 +1,979 @@
+#! /usr/bin/env perl
+
+use strict;
+use warnings;
+use utf8;
+use Config::General;
+use Data::Dump qw(dump);
+use Digest::SHA qw(sha256_hex);
+use Encode;
+use File::Slurper qw(read_text);
+use Hydra::Config;
+use Hydra::Helper::AddBuilds;
+use Hydra::Helper::CatalystUtils;
+use Hydra::Helper::Email;
+use Hydra::Helper::Exec;
+use Hydra::Helper::Nix;
+use Hydra::Model::DB;
+use Hydra::Plugin;
+use Hydra::Schema;
+use IPC::Run;
+use JSON::MaybeXS;
+use Net::Statsd;
+use Nix::Store;
+use Time::HiRes qw(clock_gettime CLOCK_MONOTONIC);
+use Try::Tiny;
+
+STDOUT->autoflush();
+STDERR->autoflush(1);
+binmode STDERR, ":encoding(utf8)";
+
+my $db = Hydra::Model::DB->new();
+my $notifyAdded = $db->storage->dbh->prepare("notify builds_added, ?");
+
+my $config = getHydraConfig();
+
+my $plugins = [Hydra::Plugin->instantiate(db => $db, config => $config)];
+
+my $dryRun = defined $ENV{'HYDRA_DRY_RUN'};
+
+my $statsdConfig = Hydra::Helper::Nix::getStatsdConfig($config);
+$Net::Statsd::HOST = $statsdConfig->{'host'};
+$Net::Statsd::PORT = $statsdConfig->{'port'};
+
+alarm 3600; # FIXME: make configurable
+
+
+sub parseJobName {
+    # Parse a job specification of the form `<project>:<jobset>:<job>
+    # [attrs]'.  The project, jobset and attrs may be omitted.  The
+    # attrs have the form `name = "value"'.
+    my ($s) = @_;
+    our $key;
+    our %attrs = ();
+    # hm, maybe I should stop programming Perl before it's too late...
+    $s =~ / ^ (?: (?: ($projectNameRE) : )? ($jobsetNameRE) : )? ($jobNameRE) \s*
+            (\[ \s* (
+              ([\w]+) (?{ $key = $^N; }) \s* = \s* \"
+              ([\w\-]+) (?{ $attrs{$key} = $^N; }) \"
+            \s* )* \])? $
+          /x
+        or die "invalid job specifier `$s'";
+    return ($1, $2, $3, \%attrs);
+}
+
+
+sub attrsToSQL {
+    my ($attrs, $id) = @_;
+
+    my $query = "1 = 1";
+
+    foreach my $name (keys %{$attrs}) {
+        my $value = $attrs->{$name};
+        $name =~ /^[\w\-]+$/ or die;
+        $value =~ /^[\w\-]+$/ or die;
+        # !!! Yes, this is horribly injection-prone... (though
+        # name/value are filtered above).  Should use SQL::Abstract,
+        # but it can't deal with subqueries.  At least we should use
+        # placeholders.
+        $query .= " and exists (select 1 from buildinputs where build = $id and name = '$name' and value = '$value')";
+    }
+
+    return $query;
+}
+
+
+# Fetch a store path from 'eval_substituter' if not already present.
+sub getPath {
+    my ($path) = @_;
+    return 1 if $MACHINE_LOCAL_STORE->isValidPath($path);
+
+    my $substituter = $config->{eval_substituter};
+
+    system("nix", "--experimental-features", "nix-command", "copy", "--from", $substituter, "--", $path)
+        if defined $substituter;
+
+    return $MACHINE_LOCAL_STORE->isValidPath($path);
+}
+
+
+sub fetchInputBuild {
+    my ($db, $project, $jobset, $name, $value) = @_;
+
+    my $prevBuild;
+
+    if ($value =~ /^\d+$/) {
+        $prevBuild = $db->resultset('Builds')->find({ id => int($value) });
+    } else {
+        my ($projectName, $jobsetName, $jobName, $attrs) = parseJobName($value);
+        $projectName ||= $project->name;
+        $jobsetName ||= $jobset->name;
+
+        my $jobset = $db->resultset('Jobsets')->search(
+            {
+                name => $jobsetName,
+                project => $projectName,
+            },
+            {}
+        )->single;
+
+        # Pick the most recent successful build of the specified job.
+        $prevBuild = $db->resultset('Builds')->search(
+            { finished => 1, jobset_id => $jobset->get_column('id')
+            , job => $jobName, buildStatus => 0 },
+            { order_by => "me.id DESC", rows => 1
+            , where => \ attrsToSQL($attrs, "me.id") })->single;
+    }
+
+    return () if !defined $prevBuild || !getPath(getMainOutput($prevBuild)->path);
+
+    #print STDERR "input `", $name, "': using build ", $prevBuild->id, "\n";
+
+    my $pkgNameRE = "(?:(?:[A-Za-z0-9]|(?:-[^0-9]))+)";
+    my $versionRE = "(?:[A-Za-z0-9\.\-]+)";
+
+    my $relName = ($prevBuild->releasename or $prevBuild->nixname);
+    my $version;
+    $version = $2 if $relName =~ /^($pkgNameRE)-($versionRE)$/;
+
+    my $mainOutput = getMainOutput($prevBuild);
+
+    my $result =
+        { storePath => $mainOutput->path
+        , id => $prevBuild->id
+        , version => $version
+        , outputName => $mainOutput->name
+        };
+    if ($MACHINE_LOCAL_STORE->isValidPath($prevBuild->drvpath)) {
+        $result->{drvPath} = $prevBuild->drvpath;
+    }
+
+    return $result;
+}
+
+
+sub fetchInputSystemBuild {
+    my ($db, $project, $jobset, $name, $value) = @_;
+
+    my ($projectName, $jobsetName, $jobName, $attrs) = parseJobName($value);
+    $projectName ||= $project->name;
+    $jobsetName ||= $jobset->name;
+
+    my @latestBuilds = $db->resultset('LatestSucceededForJobName')
+        ->search({}, {bind => [$projectName, $jobsetName, $jobName]});
+
+    my @validBuilds = ();
+    foreach my $build (@latestBuilds) {
+        push(@validBuilds, $build) if getPath(getMainOutput($build)->path);
+    }
+
+    if (scalar(@validBuilds) == 0) {
+        print STDERR "input `", $name, "': no previous build available\n";
+        return ();
+    }
+
+    my @inputs = ();
+
+    foreach my $prevBuild (@validBuilds) {
+        my $pkgNameRE = "(?:(?:[A-Za-z0-9]|(?:-[^0-9]))+)";
+        my $versionRE = "(?:[A-Za-z0-9\.\-]+)";
+
+        my $relName = ($prevBuild->releasename or $prevBuild->nixname);
+        my $version;
+        $version = $2 if $relName =~ /^($pkgNameRE)-($versionRE)$/;
+
+        my $input =
+            { storePath => getMainOutput($prevBuild)->path
+            , id => $prevBuild->id
+            , version => $version
+            , system => $prevBuild->system
+            };
+        push(@inputs, $input);
+    }
+
+    return @inputs;
+}
+
+
+sub fetchInputEval {
+    my ($db, $project, $jobset, $name, $value) = @_;
+
+    my $eval;
+
+    if ($value =~ /^\d+$/) {
+        $eval = $db->resultset('JobsetEvals')->find({ id => int($value) });
+        die "evaluation $eval->{id} does not exist\n" unless defined $eval;
+    } elsif ($value =~ /^($projectNameRE):($jobsetNameRE)$/) {
+        my $jobset = $db->resultset('Jobsets')->find({ project => $1, name => $2 });
+        die "jobset ‘$value’ does not exist\n" unless defined $jobset;
+        $eval = getLatestFinishedEval($jobset);
+        die "jobset ‘$value’ does not have a finished evaluation\n" unless defined $eval;
+    } elsif ($value =~ /^($projectNameRE):($jobsetNameRE):($jobNameRE)$/) {
+        my $jobset = $db->resultset('Jobsets')->find({ project => $1, name => $2 });
+        die "jobset ‘$1:$2’ does not exist\n" unless defined $jobset;
+
+        $eval = $db->resultset('JobsetEvals')->find(
+            { jobset_id => $jobset->id, hasnewbuilds => 1 },
+            { order_by => "id DESC", rows => 1
+            , where =>
+                \ [ # All builds in this jobset should be finished...
+                    "not exists (select 1 from JobsetEvalMembers m join Builds b on m.build = b.id where m.eval = me.id and b.finished = 0) "
+                    # ...and the specified build must have succeeded.
+                    . "and exists (select 1 from JobsetEvalMembers m join Builds b on m.build = b.id where m.eval = me.id and b.job = ? and b.buildstatus = 0)"
+                  , [ 'name', $3 ] ]
+            });
+        die "there is no successful build of ‘$value’ in a finished evaluation\n" unless defined $eval;
+    } else {
+        die;
+    }
+
+    my $jobs = {};
+    foreach my $build ($eval->builds) {
+        next unless $build->finished == 1 && $build->buildstatus == 0;
+        # FIXME: Handle multiple outputs.
+        my $out = $build->buildoutputs->find({ name => "out" });
+        next unless defined $out;
+        # FIXME: Should we fail if the path is not valid?
+        next unless $MACHINE_LOCAL_STORE->isValidPath($out->path);
+        $jobs->{$build->get_column('job')} = $out->path;
+    }
+
+    return { jobs => $jobs };
+}
+
+
+sub fetchInput {
+    my ($plugins, $db, $project, $jobset, $name, $type, $value, $emailresponsible) = @_;
+    my @inputs;
+
+    print STDERR "(" . $project->name . ":" . $jobset->name . ") Fetching input `$name` ($type) $value\n";
+
+    if ($type eq "build") {
+        @inputs = fetchInputBuild($db, $project, $jobset, $name, $value);
+    }
+    elsif ($type eq "sysbuild") {
+        @inputs = fetchInputSystemBuild($db, $project, $jobset, $name, $value);
+    }
+    elsif ($type eq "eval") {
+        @inputs = fetchInputEval($db, $project, $jobset, $name, $value);
+    }
+    elsif ($type eq "string" || $type eq "nix") {
+        die unless defined $value;
+        @inputs = { value => $value };
+    }
+    elsif ($type eq "boolean") {
+        die unless defined $value && ($value eq "true" || $value eq "false");
+        @inputs = { value => $value };
+    }
+    else {
+        my $found = 0;
+        foreach my $plugin (@{$plugins}) {
+            @inputs = $plugin->fetchInput($type, $name, $value, $project, $jobset);
+            if (defined $inputs[0]) {
+                $found = 1;
+                last;
+            }
+        }
+        die "input `$name' has unknown type `$type'." unless $found;
+    }
+
+    foreach my $input (@inputs) {
+        $input->{type} = $type;
+        $input->{emailresponsible} = $emailresponsible;
+    }
+
+    return @inputs;
+}
+
+
+sub booleanToString {
+    my ($value) = @_;
+    return $value;
+}
+
+
+sub buildInputToString {
+    my ($input) = @_;
+    return
+        "{ outPath = builtins.storePath " . $input->{storePath} . "" .
+        "; inputType = \"" . $input->{type} . "\"" .
+        (defined $input->{uri} ? "; uri = \"" . $input->{uri} . "\"" : "") .
+        (defined $input->{revNumber} ? "; rev = " . $input->{revNumber} . "" : "") .
+        (defined $input->{revision} ? "; rev = \"" . $input->{revision} . "\"" : "") .
+        (defined $input->{revCount} ? "; revCount = " . $input->{revCount} . "" : "") .
+        (defined $input->{gitTag} ? "; gitTag = \"" . $input->{gitTag} . "\"" : "") .
+        (defined $input->{shortRev} ? "; shortRev = \"" . $input->{shortRev} . "\"" : "") .
+        (defined $input->{version} ? "; version = \"" . $input->{version} . "\"" : "") .
+        (defined $input->{outputName} ? "; outputName = \"" . $input->{outputName} . "\"" : "") .
+        (defined $input->{drvPath} ? "; drvPath = builtins.storePath " . $input->{drvPath} . "" : "") .
+        ";}";
+}
+
+
+sub inputsToArgs {
+    my ($inputInfo) = @_;
+    my @res = ();
+
+    foreach my $input (sort keys %{$inputInfo}) {
+        push @res, "-I", "$input=$inputInfo->{$input}->[0]->{storePath}"
+            if scalar @{$inputInfo->{$input}} == 1
+               && defined $inputInfo->{$input}->[0]->{storePath};
+
+        die "multiple jobset input alternatives are no longer supported"
+            if scalar @{$inputInfo->{$input}} != 1;
+
+        my $alt = $inputInfo->{$input}->[0];
+
+        if ($alt->{type} eq "string") {
+            push @res, "--argstr", $input, $alt->{value};
+        }
+        elsif ($alt->{type} eq "boolean") {
+            push @res, "--arg", $input, booleanToString($alt->{value});
+        }
+        elsif ($alt->{type} eq "nix") {
+            push @res, "--arg", $input, $alt->{value};
+        }
+        elsif ($alt->{type} eq "eval") {
+            my $s = "{ ";
+            # FIXME: escape $_.  But dots should not be escaped.
+            $s .= "$_ = builtins.storePath ${\$alt->{jobs}->{$_}}; "
+                foreach keys %{$alt->{jobs}};
+            $s .= "}";
+            push @res, "--arg", $input, $s;
+        }
+        else {
+            push @res, "--arg", $input, buildInputToString($alt);
+        }
+    }
+
+    return @res;
+}
+
+
+sub evalJobs {
+    my ($jobsetName, $inputInfo, $nixExprInputName, $nixExprPath, $flakeRef) = @_;
+
+    print STDERR "($jobsetName) Evaluating...\n";
+
+    my @cmd;
+
+    if (defined $flakeRef) {
+        my $nix_expr =
+            "let " .
+            "flake = builtins.getFlake (toString \"$flakeRef\"); " .
+            "in " .
+            "flake.hydraJobs " .
+            "or flake.checks " .
+            "or (throw \"flake '$flakeRef' does not provide any Hydra jobs or checks\")";
+
+        @cmd = ("nix-eval-jobs",
+                # Disable the eval cache to prevent SQLite database contention.
+                # Since Hydra typically evaluates each revision only once,
+                # parallel workers would compete for database locks without
+                # providing any benefit from caching.
+                "--option", "eval-cache", "false",
+                "--expr", $nix_expr);
+    } else {
+        my $nixExprInput = $inputInfo->{$nixExprInputName}->[0]
+            or die "cannot find the input containing the job expression\n";
+
+        @cmd = ("nix-eval-jobs",
+                "--option", "restrict-eval", "true",
+                "<" . $nixExprInputName . "/" . $nixExprPath . ">",
+                inputsToArgs($inputInfo));
+    }
+
+    push @cmd, ("--gc-roots-dir", getGCRootsDir);
+    push @cmd, ("--max-jobs", 1);
+    push @cmd, "--meta";
+    push @cmd, "--constituents";
+    push @cmd, "--force-recurse";
+    push @cmd, ("--option", "allow-import-from-derivation", "false") if ($config->{allow_import_from_derivation} // "false") ne "true";
+    push @cmd, ("--workers", $config->{evaluator_workers} // 1);
+    push @cmd, ("--max-memory-size", $config->{evaluator_max_memory_size} // 4096);
+
+    if (defined $ENV{'HYDRA_DEBUG'}) {
+        sub escape {
+            my $s = $_;
+            $s =~ s/'/'\\''/g;
+            return "'" . $s . "'";
+        }
+        my @escaped = map escape, @cmd;
+        print STDERR "evaluator: @escaped\n";
+    }
+
+    # Unset NIX_PATH for nix-eval-jobs to ensure reproducible evaluations
+    my %env = %ENV;
+    delete $env{'NIX_PATH'};
+
+    my $evalProc = IPC::Run::start \@cmd,
+            '>', IPC::Run::new_chunker, \my $out,
+            '2>', \my $err,
+            init => sub { %ENV = %env; };
+
+    return sub {
+        while (1) {
+            $evalProc->pump;
+            if (!defined $out && !defined $err) {
+                $evalProc->finish;
+                if ($?) {
+                    die "nix-eval-jobs returned " . ($? & 127 ? "signal $?" : "exit code " . ($? >> 8)) . "\n";
+                }
+                return;
+            }
+
+            if (defined $err) {
+                print STDERR "$err";
+                undef $err;
+            }
+
+            if (defined $out && $out ne '') {
+                my $job;
+                try {
+                    $job = decode_json($out);
+                } catch {
+                    warn "nix-eval-jobs sent invalid JSON.\n  parse error: $_\n  invalid json: $out\n";
+                };
+                undef $out;
+                if (defined $job) {
+                    return $job;
+                }
+            }
+        }
+    };
+}
+
+
+# Return the most recent evaluation of the given jobset (that
+# optionally had new builds), or undefined if no such evaluation
+# exists.
+sub getPrevJobsetEval {
+    my ($db, $jobset, $hasNewBuilds) = @_;
+    my ($prevEval) = $jobset->jobsetevals(
+        ($hasNewBuilds ? { hasnewbuilds => 1 } : { }),
+        { order_by => "id DESC", rows => 1 });
+    return $prevEval;
+}
+
+
+# Check whether to add the build described by $buildInfo.
+sub checkBuild {
+    my ($db, $jobset, $eval, $inputInfo, $buildInfo, $buildMap, $prevEval, $jobOutPathMap, $plugins) = @_;
+
+    my @outputNames = sort keys %{$buildInfo->{outputs}};
+    die unless scalar @outputNames;
+
+    # In various checks we can use an arbitrary output (the first)
+    # rather than all outputs, since if one output is the same, the
+    # others will be as well.
+    my $firstOutputName = $outputNames[0];
+    my $firstOutputPath = $buildInfo->{outputs}->{$firstOutputName};
+
+    my $jobName = $buildInfo->{attr} or die;
+    my $drvPath = $buildInfo->{drvPath} or die;
+
+    my $build;
+
+    $db->txn_do(sub {
+        # Don't add a build that has already been scheduled for this
+        # job, or has been built but is still a "current" build for
+        # this job.  Note that this means that if the sources of a job
+        # are changed from A to B and then reverted to A, three builds
+        # will be performed (though the last one will probably use the
+        # cached result from the first).  This ensures that the builds
+        # with the highest ID will always be the ones that we want in
+        # the channels.  FIXME: Checking the output paths doesn't take
+        # meta-attributes into account.  For instance, do we want a
+        # new build to be scheduled if the meta.maintainers field is
+        # changed?
+        if (defined $prevEval) {
+            my $pathOrDrvConstraint = defined $firstOutputPath
+                ? { path => $firstOutputPath }
+                : { drvPath => $drvPath };
+
+            my ($prevBuild) = $prevEval->builds->search(
+                # The "project" and "jobset" constraints are
+                # semantically unnecessary (because they're implied by
+                # the eval), but they give a factor 1000 speedup on
+                # the Nixpkgs jobset with PostgreSQL.
+                { jobset_id => $jobset->get_column('id'), job => $jobName,
+                  name => $firstOutputName, %$pathOrDrvConstraint },
+                { rows => 1, columns => ['id', 'finished'], join => ['buildoutputs'] });
+            if (defined $prevBuild) {
+                #print STDERR "    already scheduled/built as build ", $prevBuild->id, "\n";
+                $buildMap->{$prevBuild->id} = { id => $prevBuild->id, jobName => $jobName, new => 0, drvPath => $drvPath };
+
+                if ($prevBuild->finished) {
+                    $db->storage->dbh->do("notify cached_build_finished, ?", undef, "${\$eval->id}\t${\$prevBuild->id}");
+                } else {
+                    $db->storage->dbh->do("notify cached_build_queued, ?", undef, "${\$eval->id}\t${\$prevBuild->id}");
+                }
+
+                return;
+            }
+        }
+
+        # Prevent multiple builds with the same (job, outPath) from
+        # being added.
+        my $prev = $$jobOutPathMap{$jobName . "\t" . $firstOutputPath};
+        if (defined $prev) {
+            #print STDERR "    already scheduled as build ", $prev, "\n";
+            return;
+        }
+
+        my $time = time();
+
+        sub getMeta {
+            my ($s, $def) = @_;
+            return ($s || "") eq "" ? $def : $s;
+        }
+
+        sub getMetaStrings {
+            my ($v, $k, $acc) = @_;
+            my $t = ref $v;
+
+            if ($t eq 'HASH') {
+                push @$acc, $v->{$k} if exists $v->{$k};
+            } elsif ($t eq 'ARRAY') {
+                getMetaStrings($_, $k, $acc) foreach @$v;
+            } elsif (defined $v) {
+                push @$acc, $v;
+            }
+        }
+
+        sub getMetaConcatStrings {
+            my ($v, $k) = @_;
+
+            my @strings;
+            getMetaStrings($v, $k, \@strings);
+            return join(", ", @strings) || undef;
+        }
+
+        # Add the build to the database.
+        $build = $jobset->builds->create(
+            { timestamp => $time
+            , jobset_id => $jobset->id
+            , job => $jobName
+            , description => getMeta($buildInfo->{meta}->{description}, undef)
+            , license => getMetaConcatStrings($buildInfo->{meta}->{license}, "shortName")
+            , homepage => getMeta($buildInfo->{meta}->{homepage}, undef)
+            , maintainers => getMetaConcatStrings($buildInfo->{meta}->{maintainers}, "email")
+            , maxsilent => getMeta($buildInfo->{meta}->{maxSilent}, 7200)
+            , timeout => getMeta($buildInfo->{meta}->{timeout}, 36000)
+            , nixname => $buildInfo->{name}
+            , drvpath => $drvPath
+            , system => $buildInfo->{system}
+            , priority => getMeta($buildInfo->{meta}->{schedulingPriority}, 100)
+            , finished => 0
+            , iscurrent => 1
+            , ischannel => getMeta($buildInfo->{meta}->{isChannel}, 0)
+            });
+
+        $build->buildoutputs->create({ name => $_, path => $buildInfo->{outputs}->{$_} })
+            foreach @outputNames;
+
+        $buildMap->{$build->id} = { id => $build->id, jobName => $jobName, new => 1, drvPath => $drvPath };
+        $$jobOutPathMap{$jobName . "\t" . $firstOutputPath} = $build->id;
+
+        $db->storage->dbh->do("notify build_queued, ?", undef, $build->id);
+        print STDERR "added build ${\$build->id} (${\$jobset->get_column('project')}:${\$jobset->name}:$jobName)\n";
+    });
+
+    return $build;
+};
+
+
+sub fetchInputs {
+    my ($project, $jobset, $inputInfo) = @_;
+    foreach my $input ($jobset->jobsetinputs->all) {
+        foreach my $alt ($input->jobsetinputalts->all) {
+            push @{$$inputInfo{$input->name}}, $_
+                foreach fetchInput($plugins, $db, $project, $jobset, $input->name, $input->type, $alt->value, $input->emailresponsible);
+        }
+    }
+}
+
+
+sub setJobsetError {
+    my ($jobset, $errorMsg, $errorTime) = @_;
+    my $prevError = $jobset->errormsg;
+
+    eval {
+        $db->txn_do(sub {
+            $jobset->update({ errormsg => $errorMsg, errortime => $errorTime, fetcherrormsg => undef });
+        });
+    };
+    if (defined $errorMsg && $errorMsg ne ($prevError // "") || $ENV{'HYDRA_MAIL_TEST'}) {
+        sendJobsetErrorNotification($jobset, $errorMsg);
+    }
+}
+
+
+sub sendJobsetErrorNotification() {
+    my ($jobset, $errorMsg) = @_;
+
+    chomp $errorMsg;
+
+    return unless $config->{email_notification} // 0;
+    return if $jobset->project->owner->emailonerror == 0;
+    return if $errorMsg eq "";
+
+    my $projectName = $jobset->get_column('project');
+    my $jobsetName = $jobset->name;
+    my $body = "Hi,\n"
+        . "\n"
+        . "This is to let you know that evaluation of the Hydra jobset ‘$projectName:$jobsetName’\n"
+        . "resulted in the following error:\n"
+        . "\n"
+        . "$errorMsg"
+        . "\n"
+        . "Regards,\n\nThe Hydra build daemon.\n";
+
+    try {
+        sendEmail(
+            $config,
+            $jobset->project->owner->emailaddress,
+            "Hydra $projectName:$jobsetName evaluation error",
+            $body,
+            [ 'X-Hydra-Project' => $projectName
+            , 'X-Hydra-Jobset'  => $jobsetName
+            ]);
+    } catch {
+        warn "error sending email: $_\n";
+    };
+}
+
+
+sub permute {
+    my @list = @_;
+    for (my $n = scalar @list - 1; $n > 0; $n--) {
+        my $k = int(rand($n + 1)); # 0 <= $k <= $n
+        @list[$n, $k] = @list[$k, $n];
+    }
+    return @list;
+}
+
+
+sub checkJobsetWrapped {
+    my ($jobset, $tmpId) = @_;
+    my $project = $jobset->project;
+    my $jobsetsJobset = length($project->declfile) && $jobset->name eq ".jobsets";
+    my $inputInfo = {};
+    if ($jobsetsJobset) {
+        my @declInputs = fetchInput($plugins, $db, $project, $jobset, "decl", $project->decltype, $project->declvalue, 0);
+        my $declInput = $declInputs[0] or die "cannot find the input containing the declarative project specification\n";
+        die "multiple alternatives for the input containing the declarative project specification are not supported\n"
+            if scalar @declInputs != 1;
+        my $declFile = $declInput->{storePath} . "/" . $project->declfile;
+        my $declText = read_text($declFile)
+            or die "Couldn't read declarative specification file $declFile: $!\n";
+        my $declSpec;
+        eval {
+            $declSpec = decode_json($declText);
+        };
+
+        die "Declarative specification file $declFile not valid JSON: $@\n" if $@;
+
+        if (ref $declSpec eq "HASH") {
+            my $isStatic = 1;
+            foreach my $elem (values %$declSpec) {
+                if (ref $elem ne "HASH") {
+                    $isStatic = 0;
+                    last;
+                }
+            }
+            if ($isStatic) {
+                # Since all of its keys are hashes, assume the json document
+                # itself is the entire set of jobs
+                handleDeclarativeJobsetJson($db, $project, $declSpec);
+                $db->txn_do(sub {
+                    $jobset->update({ lastcheckedtime => time, fetcherrormsg => undef });
+                });
+                return;
+            } else {
+                # Update the jobset with the spec's inputs, and the continue
+                # evaluating the .jobsets jobset.
+                updateDeclarativeJobset($config, $db, $project, ".jobsets", $declSpec);
+                $jobset->discard_changes;
+                $inputInfo->{"declInput"} = [ $declInput ];
+                $inputInfo->{"projectName"} = [ fetchInput($plugins, $db, $project, $jobset, "projectName", "string", $project->name, 0) ];
+
+            }
+        } else {
+            die "Declarative specification file $declFile is not a dictionary"
+        }
+    }
+
+    # Fetch all values for all inputs.
+    my $checkoutStart = clock_gettime(CLOCK_MONOTONIC);
+    eval {
+        fetchInputs($project, $jobset, $inputInfo);
+    };
+    my $fetchError = $@;
+
+    my $flakeRef = $jobset->flake;
+    if (defined $flakeRef) {
+        (my $res, my $json, my $stderr) = captureStdoutStderr(
+            600, "nix", "flake", "metadata", "--refresh", "--json", "--", $flakeRef);
+        die "'nix flake metadata' returned " . ($res & 127 ? "signal $res" : "exit code " . ($res >> 8))
+            . ":\n" . ($stderr ? decode("utf-8", $stderr) : "(no output)\n")
+            if $res;
+        $flakeRef = decode_json($json)->{'url'};
+    }
+
+    Net::Statsd::increment("hydra.evaluator.checkouts");
+    my $checkoutStop = clock_gettime(CLOCK_MONOTONIC);
+    Net::Statsd::timing("hydra.evaluator.checkout_time", int(($checkoutStop - $checkoutStart) * 1000));
+
+    if ($fetchError) {
+        Net::Statsd::increment("hydra.evaluator.failed_checkouts");
+        print STDERR $fetchError;
+        $db->txn_do(sub {
+            $jobset->update({ lastcheckedtime => time, fetcherrormsg => $fetchError }) if !$dryRun;
+            $db->storage->dbh->do("notify eval_failed, ?", undef, join("\t", $tmpId, $jobset->get_column('id')));
+        });
+        return;
+    }
+
+    # Hash the arguments to nix-eval-jobs and check the
+    # JobsetInputHashes to see if the previous evaluation had the same
+    # inputs.  If so, bail out.
+    my @args = ($jobset->nixexprinput // "", $jobset->nixexprpath // "", inputsToArgs($inputInfo));
+    my $argsHash = sha256_hex("@args");
+    my $prevEval = getPrevJobsetEval($db, $jobset, 0);
+    if (defined $prevEval && $prevEval->hash eq $argsHash && !$dryRun && !$jobset->forceeval && (!defined($flakeRef) || ($prevEval->flake eq $flakeRef))) {
+        print STDERR "  jobset is unchanged, skipping\n";
+        Net::Statsd::increment("hydra.evaluator.unchanged_checkouts");
+        $db->txn_do(sub {
+            $jobset->update({ lastcheckedtime => time, fetcherrormsg => undef });
+            $db->storage->dbh->do("notify eval_cached, ?", undef, join("\t",
+                $tmpId,
+                $jobset->get_column('id'),
+                $prevEval->get_column('id'))
+            );
+        });
+        return;
+    }
+
+    # Evaluate the job expression.
+    my $evalStart = clock_gettime(CLOCK_MONOTONIC);
+    my $evalStop;
+    my $jobsIter = evalJobs($project->name . ":" . $jobset->name, $inputInfo, $jobset->nixexprinput, $jobset->nixexprpath, $flakeRef);
+
+    if ($dryRun) {
+        while (defined(my $job = $jobsIter->())) {
+            my $name = $job->{attr};
+            if (defined $job->{drvPath}) {
+                print STDERR "good job $name: $job->{drvPath}\n";
+            } else {
+                print STDERR "failed job $name: $job->{error}\n";
+            }
+        }
+        return;
+    }
+
+    # Store the error messages for jobs that failed to evaluate.
+    my $evaluationErrorTime = time;
+    my $evaluationErrorMsg = "";
+    my $evaluationErrorRecord = $db->resultset('EvaluationErrors')->create(
+        { errormsg => $evaluationErrorMsg
+        , errortime => $evaluationErrorTime
+        }
+    );
+
+    my $jobOutPathMap = {};
+    my $jobsetChanged = 0;
+    my %buildMap;
+
+    my @jobs;
+    push @jobs, $_ while defined($_ = $jobsIter->());
+
+    $db->txn_do(sub {
+        my $prevEval = getPrevJobsetEval($db, $jobset, 1);
+
+        # Clear the "current" flag on all builds.  Since we're in a
+        # transaction this will only become visible after the new
+        # current builds have been added.
+        $jobset->builds->search({iscurrent => 1})->update({iscurrent => 0});
+
+        my $ev = $jobset->jobsetevals->create(
+            { hash => $argsHash
+            , evaluationerror => $evaluationErrorRecord
+            , timestamp => time
+            , checkouttime => abs(int($checkoutStop - $checkoutStart))
+            , evaltime => 0
+            , hasnewbuilds => 0
+            , nrbuilds => 0
+            , flake => $flakeRef
+            , nixexprinput => $jobset->nixexprinput
+            , nixexprpath => $jobset->nixexprpath
+            });
+
+        my @jobsWithConstituents;
+
+        foreach my $job (@jobs) {
+            if ($jobsetsJobset) {
+                die "The .jobsets jobset must only have a single job named 'jobsets'"
+                    unless $job->{attr} eq "jobsets";
+            }
+
+            $evaluationErrorMsg .=
+                ($job->{attr} ne "" ? "in job ‘$job->{attr}’" : "at top-level") .
+                ":\n" . $job->{error} . "\n\n" if defined $job->{error};
+
+            checkBuild($db, $jobset, $ev, $inputInfo, $job, \%buildMap, $prevEval, $jobOutPathMap, $plugins)
+                unless defined $job->{error};
+
+            if (defined $job->{constituents}) {
+                push @jobsWithConstituents, $job;
+            }
+        }
+
+        # Have any builds been added or removed since last time?
+        $jobsetChanged =
+            (scalar(grep { $_->{new} } values(%buildMap)) > 0)
+            || (defined $prevEval && $prevEval->jobsetevalmembers->count != scalar(keys %buildMap));
+
+        $ev->update({
+            hasnewbuilds => $jobsetChanged ? 1 : 0,
+            nrbuilds => $jobsetChanged ? scalar(keys %buildMap) : undef
+        });
+
+        $db->storage->dbh->do("notify eval_added, ?", undef,
+                              join("\t", $tmpId, $jobset->get_column('id'), $ev->id));
+
+        if ($jobsetChanged) {
+            # Create JobsetEvalMembers mappings.
+            foreach my $id (keys %buildMap) {
+                my $x = $buildMap{$id};
+                $ev->jobsetevalmembers->create({ build => $id, isnew => $x->{new} });
+            }
+
+            # Create AggregateConstituents mappings.  Since there can
+            # be jobs that alias each other, if there are multiple
+            # builds for the same derivation, pick the one with the
+            # shortest name.
+            my %drvPathToId;
+            foreach my $id (keys %buildMap) {
+                my $x = $buildMap{$id};
+                my $y = $drvPathToId{$x->{drvPath}};
+                if (defined $y) {
+                    next if length $x->{jobName} > length $y->{jobName};
+                    next if length $x->{jobName} == length $y->{jobName} && $x->{jobName} ge $y->{jobName};
+                }
+                $drvPathToId{$x->{drvPath}} = $x;
+            }
+
+            foreach my $job (values @jobsWithConstituents) {
+                next unless defined $job->{constituents};
+                if (defined $job->{error}) {
+                    die "aggregate job ‘$job->{attr}’ failed with the error: $job->{error}\n";
+                }
+
+                my $x = $drvPathToId{$job->{drvPath}} or
+                    die "aggregate job ‘$job->{attr}’ has no corresponding build record.\n";
+                foreach my $drvPath (@{$job->{constituents}}) {
+                    my $constituent = $drvPathToId{$drvPath};
+                    if (defined $constituent) {
+                        $db->resultset('AggregateConstituents')->update_or_create({aggregate => $x->{id}, constituent => $constituent->{id}});
+                    } else {
+                        warn "aggregate job ‘$job->{attr}’ has a constituent ‘$drvPath’ that doesn't correspond to a Hydra build\n";
+                    }
+                }
+            }
+
+            foreach my $name (keys %{$inputInfo}) {
+                for (my $n = 0; $n < scalar(@{$inputInfo->{$name}}); $n++) {
+                    my $input = $inputInfo->{$name}->[$n];
+                    $ev->jobsetevalinputs->create(
+                        { name => $name
+                        , altnr => $n
+                        , type => $input->{type}
+                        , uri => $input->{uri}
+                        , revision => $input->{revision}
+                        , shortRevLength => length($input->{shortRev})
+                        , value => $input->{value}
+                        , dependency => $input->{id}
+                        , path => $input->{storePath} || "" # !!! temporary hack
+                        , sha256hash => $input->{sha256hash}
+                        });
+                }
+            }
+
+            print STDERR "  created new eval ", $ev->id, "\n";
+            $ev->builds->update({iscurrent => 1});
+
+            # Wake up hydra-queue-runner.
+            my $lowestId;
+            foreach my $id (keys %buildMap) {
+                my $x = $buildMap{$id};
+                $lowestId = $id if $x->{new} && (!defined $lowestId || $id < $lowestId);
+            }
+            $notifyAdded->execute($lowestId) if defined $lowestId;
+
+        } else {
+            print STDERR "  created cached eval ", $ev->id, "\n";
+            $prevEval->builds->update({iscurrent => 1}) if defined $prevEval;
+        }
+
+        # If this is a one-shot jobset, disable it now.
+        $jobset->update({ enabled => 0 }) if $jobset->enabled == 2;
+
+        $jobset->update({ lastcheckedtime => time, forceeval => undef });
+
+        $evaluationErrorRecord->update({ errormsg => $evaluationErrorMsg });
+        setJobsetError($jobset, $evaluationErrorMsg, $evaluationErrorTime);
+
+        $evalStop = clock_gettime(CLOCK_MONOTONIC);
+        $ev->update({ evaltime => abs(int($evalStop - $evalStart)) });
+    });
+
+    Net::Statsd::timing("hydra.evaluator.eval_time", int(($evalStop - $evalStart) * 1000));
+    Net::Statsd::increment("hydra.evaluator.evals");
+    Net::Statsd::increment("hydra.evaluator.cached_evals") unless $jobsetChanged;
+}
+
+
+sub checkJobset {
+    my ($jobset) = @_;
+
+    my $startTime = clock_gettime(CLOCK_MONOTONIC);
+
+    # Add an ID to eval_* notifications so receivers can correlate
+    # them.
+    my $tmpId = "${startTime}.$$";
+
+    $db->storage->dbh->do("notify eval_started, ?", undef,
+                          join("\t", $tmpId, $jobset->get_column('id')));
+
+    eval {
+        checkJobsetWrapped($jobset, $tmpId);
+    };
+    my $checkError = $@;
+
+    my $stopTime = clock_gettime(CLOCK_MONOTONIC);
+    Net::Statsd::timing("hydra.evaluator.total_time", int(($stopTime - $startTime) * 1000));
+
+    my $failed = 0;
+    if ($checkError) {
+        print STDERR $checkError;
+        my $eventTime = time;
+        $db->txn_do(sub {
+            $jobset->update({lastcheckedtime => $eventTime});
+            setJobsetError($jobset, $checkError, $eventTime);
+            $db->storage->dbh->do("notify eval_failed, ?", undef, join("\t", $tmpId, $jobset->get_column('id')));
+        }) if !$dryRun;
+        $failed = 1;
+    }
+
+    return $failed;
+}
+
+
+die "syntax: $0 <PROJECT> <JOBSET>\n" unless @ARGV == 2;
+
+my $projectName = $ARGV[0];
+my $jobsetName = $ARGV[1];
+my $jobset = $db->resultset('Jobsets')->find($projectName, $jobsetName) or
+    die "$0: specified jobset \"$projectName:$jobsetName\" does not exist\n";
+exit checkJobset($jobset);

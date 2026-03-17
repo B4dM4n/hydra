@@ -23,7 +23,7 @@ Running Hydra is currently only supported on NixOS. The [hydra module](https://g
 }
 ```
 ### Creating An Admin User
-Once the Hydra service has been configured as above and activate you should already be able to access the UI interface at the specified URL. However some actions require an admin user which has to be created first:
+Once the Hydra service has been configured as above and activated, you should already be able to access the UI interface at the specified URL. However some actions require an admin user which has to be created first:
 
 ```
 $ su - hydra
@@ -80,9 +80,14 @@ $ nix build
 You can use the provided shell.nix to get a working development environment:
 ```
 $ nix develop
-$ mesonConfigurePhase
-$ ninja
+$ ln -svf ../../../build/src/bootstrap src/root/static/bootstrap
+$ ln -svf ../../../build/src/fontawesome src/root/static/fontawesome
+$ ln -svf ../../../../build/src/flot src/root/static/js/flot
+$ meson setup build
+$ ninja -C build
 ```
+
+The development environment can also automatically be established using [nix-direnv](https://github.com/nix-community/nix-direnv).
 
 ### Executing Hydra During Development
 
@@ -100,7 +105,7 @@ Have a look at the [Procfile](./Procfile) if you want to see how the processes a
 conflicts with services that might be running on your host, hydra and postgress are started on custom ports:
 
 - hydra-server: 63333 with the username "alice" and the password "foobar"
-- postgresql: 64444
+- postgresql: 64444, can be connected to using `psql -p 64444 -h localhost hydra`
 
 Note that this is only ever meant as an ad-hoc way of executing Hydra during development. Please make use of the
 NixOS module for actually running Hydra in production.

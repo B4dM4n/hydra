@@ -1,0 +1,19 @@
+[% WRAPPER layout.tt
+titleHTML="Latest builds" _
+    (job ? " for job " _ linkToJob(jobset, job) :
+     jobset ? " for jobset " _ linkToJobset(jobset) :
+     project ? " for project " _ linkToProject(project) :
+     "")
+  title="Latest builds" _
+    (job ? " for job " _ makeNameTextForJob(jobset, job) :
+     jobset ? " for jobset " _ makeNameTextForJobset(jobset) :
+     project ? " for project $project.name" :
+     "") %]
+[% PROCESS common.tt %]
+
+<p>Showing builds [% (page - 1) * resultsPerPage + 1 %] - [% (page - 1) * resultsPerPage + builds.size %] out of [% HTML.escape(total) %] in order of descending finish time.</p>
+
+[% INCLUDE renderBuildList hideProjectName=project hideJobsetName=jobset hideJobName=job %]
+[% INCLUDE renderPager %]
+
+[% END %]
